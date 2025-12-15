@@ -1,0 +1,18 @@
+name: funasr-ci
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - torch>=2.0.0
+    - torchaudio>=2.0.0
+    - funasr>=1.0.0
+    - modelscope
+    - PySide6>=6.0.0
+    - moviepy
+    - psutil>=5.0.0
+    - python-docx
+    - reportlab

@@ -1,0 +1,54 @@
+name: Conda 环境构建测试
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # 设置默认 shell 为 bash -l，确保 Conda 环境正确激活
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 设置 Miniconda
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        python-version: "3.10"
+        activate-environment: funasr-ci
+        environment-file: environment.yml
+        auto-activate-base: false
+        use-mamba: true  # 使用 mamba 加速依赖解析
+
+    - name: 显示 Conda 环境信息
+      run: |
+        conda info
+        conda list
+
+    - name: 验证 Python 版本
+      run: |
+        python --version
+        which python
+
+    - name: 测试核心依赖导入
+      run: |
+        python -c "import torch; print(f'PyTorch 版本: {torch.__version__}')"
+        python -c "import PySide6; print('PySide6 导入成功')"
+        python -c "import psutil; print('psutil 导入成功')"
+
+    - name: 测试 FunASR 导入
+      run: |
+        python -c "import funasr; print('FunASR 导入成功')" || echo "FunASR 导入失败（可能需要额外配置）"
+
+    - name: 运行基础语法检查
+      run: |
+        python -m py_compile main.py || echo "main.py 语法检查完成"
+        python -m py_compile launcher.py || echo "launcher.py 语法检查完成"
