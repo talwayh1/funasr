@@ -1,0 +1,549 @@
+# main.py (v5.9 - 稳定性和容错性增强)
+import sys
+import os
+import torch
+import multiprocessing
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+# 统一从qt_compat导入，确保兼容性
+from qt_compat import *
+# 导入重构后的核心控制器和配置类
+from processing_controller import ProcessingController, ProcessingConfig, ProcessingState
+# 导入ffmpeg检查工具
+from ffmpeg_manager import ensure_ffmpeg_is_ready
+
+# 尝试导入moviepy，用于启动检查
+try:
+    from moviepy.editor import VideoFileClip
+except ImportError:
+    VideoFileClip = None
+
+# --- ffsubsync 的可用性检查 ---
+def check_ffsubsync_availability():
+    """检查ffsubsync命令是否在系统路径中可用"""
+    try:
+        # 【已修复】增加 encoding 和 errors 参数，增强在Windows下的兼容性
+        subprocess.run(
+            ['ffsubsync', '--version'],
+            capture_output=True,
+            text=True,
+            check=True,
+            encoding='utf-8',
+            errors='ignore'
+        )
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+
+# 通过环境变量控制FFSubSync功能的启用/禁用
+FFSUBSYNC_AVAILABLE = (os.getenv("APP_DISABLE_FFSUBSYNC", "0") not in ["1", "true", "True"]) \
+                      and check_ffsubsync_availability()
+
+def setup_model_cache():
+    """设置模型缓存目录和性能优化环境变量"""
+    # 修复打包后的路径问题
+    if getattr(sys, 'frozen', False):
+        # 打包后的环境
+        project_root = Path(sys.executable).parent
+    else:
+        # 开发环境
+        project_root = Path(__file__).parent
+
+    cache_dir = project_root / "model_cache" / "modelscope"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # 设置所有相关的缓存环境变量，与download_models.py保持一致
+    env_vars = {
+        'MODELSCOPE_CACHE': str(cache_dir),
+        'HF_HOME': str(cache_dir),
+        'TRANSFORMERS_CACHE': str(cache_dir),
+        'HF_DATASETS_CACHE': str(cache_dir),
+        'TORCH_HOME': str(cache_dir),
+    }
+
+    for key, value in env_vars.items():
+        os.environ[key] = value
+
+    # 性能优化：控制PyTorch/BLAS线程数，防止与FFmpeg争抢CPU
+    # 每个ASR进程内部使用单线程，避免过度并发
+    threading_vars = {
+        'OMP_NUM_THREADS': '1',
+        'OPENBLAS_NUM_THREADS': '1',
+        'MKL_NUM_THREADS': '1',
+        'VECLIB_MAXIMUM_THREADS': '1',
+        'NUMEXPR_NUM_THREADS': '1',
+    }
+
+    for key, value in threading_vars.items():
+        os.environ.setdefault(key, value)
+
+    # 仅在主进程中打印一次
+    if multiprocessing.current_process().name == 'MainProcess':
+        print(f"[FOLDER] 模型缓存路径已设置为: {cache_dir}")
+
+setup_model_cache()
+
+class FileScannerWorker(QObject):
+    """在后台线程中扫描文件"""
+    file_found = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, supported_extensions):
+        super().__init__()
+        self._running = True
+        self.supported_extensions = [ext.lower() for ext in supported_extensions]
+
+    def stop(self):
+        self._running = False
+
+    def run(self, paths):
+        for path_str in paths:
+            if not self._running: break
+            path = Path(path_str)
+            if path.is_dir():
+                for root, _, files in os.walk(path):
+                    if not self._running: break
+                    for name in files:
+                        if not self._running: break
+                        file_path = Path(root) / name
+                        if file_path.suffix.lower() in self.supported_extensions:
+                            self.file_found.emit(str(file_path))
+            elif path.is_file() and path.suffix.lower() in self.supported_extensions:
+                self.file_found.emit(str(path))
+        self.finished.emit()
+
+class GPUDetector:
+    """检测GPU"""
+    def __init__(self):
+        self.cuda_available = torch.cuda.is_available()
+        self.recommended_device = "cuda" if self.cuda_available else "cpu"
+
+class DropAreaListWidget(QListWidget):
+    """支持文件拖拽的QListWidget"""
+    filesDropped = pyqtSignal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        """
+        [修复] 使用 acceptProposedAction() 来正确表明该控件可以接受放下操作。
+        """
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent):
+        """
+        [新增] 处理拖动移动事件以提供视觉反馈。
+        """
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        """
+        此方法能正确地提取文件路径并发出信号，此处无需更改。
+        """
+        files = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if files:
+            self.filesDropped.emit(files)
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("FunASR 高效处理工具 v5.9 - 高性能版")
+        self.setGeometry(100, 100, 900, 750)
+        self.all_files = set()
+        self.is_processing = False
+        
+        self.scanner_thread = None
+        self.scanner_worker = None
+        
+        self.gpu_detector = GPUDetector()
+        self.device = self.gpu_detector.recommended_device
+        
+        self.processing_controller = ProcessingController(self)
+        self.supported_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.wav', '.mp3', '.flac', '.m4a']
+        
+        self._setup_ui()
+        self._setup_connections()
+        self._check_dependencies()
+        self.log_message(f"系统检测到最佳设备: {self.device.upper()}")
+        
+        # --- 核心改动 ---
+        # 不再预热引擎，只显示就绪信息
+        self.log_message("[OK] UI已就绪。引擎将在开始处理时按需加载。")
+
+    def _setup_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+
+        top_layout = QHBoxLayout()
+        self.select_file_button = QPushButton("选择文件")
+        self.select_folder_button = QPushButton("选择文件夹")
+        self.clear_button = QPushButton("清空列表")
+        top_layout.addWidget(self.select_file_button)
+        top_layout.addWidget(self.select_folder_button)
+        top_layout.addWidget(self.clear_button)
+        top_layout.addStretch()
+
+        self.file_list_widget = DropAreaListWidget()
+
+        settings_group = QGroupBox("处理设置")
+        settings_layout = QGridLayout(settings_group)
+        settings_layout.addWidget(QLabel("输出格式:"), 0, 0)
+        self.srt_checkbox = QCheckBox("SRT字幕"); self.srt_checkbox.setChecked(True)
+        self.srt_txt_checkbox = QCheckBox("SRT格式(.txt)")
+        self.txt_checkbox = QCheckBox("TXT文本"); self.txt_checkbox.setChecked(False)
+        self.json_checkbox = QCheckBox("JSON数据")
+        self.txt_md_checkbox = QCheckBox("TXT (Markdown格式)")
+        self.docx_checkbox = QCheckBox("DOCX (.docx)")
+        self.pdf_checkbox = QCheckBox("PDF (.pdf)")
+        format_layout = QHBoxLayout()
+        format_layout.addWidget(self.srt_checkbox)
+        format_layout.addWidget(self.srt_txt_checkbox)
+        format_layout.addWidget(self.txt_checkbox)
+        format_layout.addWidget(self.json_checkbox)
+        format_layout.addWidget(self.txt_md_checkbox)
+        format_layout.addWidget(self.docx_checkbox)
+        format_layout.addWidget(self.pdf_checkbox)
+        settings_layout.addLayout(format_layout, 0, 1)
+
+        self.cfr_conversion_checkbox = QCheckBox("启用VFR转CFR (修复手机录屏等变帧率视频的音画同步问题)")
+        settings_layout.addWidget(self.cfr_conversion_checkbox, 1, 0, 1, 2)
+
+        # FFSubSync 选项组
+        self.ffsubsync_checkbox = QCheckBox("启用FFSubSync校准 (对识别后的字幕进行二次精校)")
+        self.ffsubsync_checkbox.setChecked(True)  # 默认勾选
+        settings_layout.addWidget(self.ffsubsync_checkbox, 2, 0, 1, 2)
+
+        # 【新增】FFSubSync 高级选项
+        ffsubsync_advanced_layout = QHBoxLayout()
+        ffsubsync_advanced_layout.addWidget(QLabel("  ├─ VAD算法:"))
+        self.vad_combo = QComboBox()
+        self.vad_combo.addItems(["silero (最准确,深度学习)", "webrtc (默认,快速)", "auditok (低质量音频)"])
+        self.vad_combo.setCurrentIndex(0)  # 默认选择 silero
+        self.vad_combo.setToolTip("Silero: 最准确（推荐）; WebRTC: 快速通用; Auditok: 适合低质量音频")
+        ffsubsync_advanced_layout.addWidget(self.vad_combo)
+
+        ffsubsync_advanced_layout.addWidget(QLabel("  最大偏移(秒):"))
+        self.max_offset_spinbox = QSpinBox()
+        self.max_offset_spinbox.setRange(10, 300)
+        self.max_offset_spinbox.setValue(60)
+        self.max_offset_spinbox.setToolTip("限制字幕搜索范围，值越小速度越快")
+        ffsubsync_advanced_layout.addWidget(self.max_offset_spinbox)
+        ffsubsync_advanced_layout.addStretch()
+        settings_layout.addLayout(ffsubsync_advanced_layout, 3, 0, 1, 2)
+
+        # 新增：断点续传选项
+        self.resume_checkbox = QCheckBox("启用断点续传 (跳过已完成的文件)")
+        self.resume_checkbox.setChecked(True)
+        settings_layout.addWidget(self.resume_checkbox, 4, 0, 1, 2)
+
+        self.progress_bar = QProgressBar()
+        # --- 核心改动 ---
+        self.status_label = QLabel("就绪。请添加文件并点击开始。")
+        
+        # 新增：统计信息显示
+        self.stats_label = QLabel("统计信息: 等待开始...")
+        
+        self.log_widget = QTextEdit(); self.log_widget.setReadOnly(True)
+
+        bottom_layout = QHBoxLayout()
+        # --- 核心改动 ---
+        self.run_button = QPushButton("开始处理"); self.run_button.setEnabled(False)
+        self.pause_button = QPushButton("暂停"); self.pause_button.setEnabled(False)  # 新增
+        self.stop_button = QPushButton("停止处理"); self.stop_button.setEnabled(False)
+        bottom_layout.addWidget(self.run_button)
+        bottom_layout.addWidget(self.pause_button)  # 新增
+        bottom_layout.addWidget(self.stop_button)
+        bottom_layout.addStretch()
+
+        main_layout.addLayout(top_layout)
+        main_layout.addWidget(QLabel("文件列表 (可拖拽文件或文件夹到此区域):"))
+        main_layout.addWidget(self.file_list_widget)
+        main_layout.addWidget(settings_group)
+        main_layout.addWidget(self.progress_bar)
+        main_layout.addWidget(self.status_label)
+        main_layout.addWidget(self.stats_label)  # 新增：统计信息显示
+        main_layout.addWidget(QLabel("日志:"))
+        main_layout.addWidget(self.log_widget)
+        main_layout.addLayout(bottom_layout)
+
+    def _setup_connections(self):
+        self.select_file_button.clicked.connect(self.select_files)
+        self.select_folder_button.clicked.connect(self.select_folder)
+        self.clear_button.clicked.connect(self.clear_file_list)
+        self.file_list_widget.filesDropped.connect(self._add_paths_to_list)
+        self.file_list_widget.model().rowsInserted.connect(self._update_run_button_state)
+        self.file_list_widget.model().rowsRemoved.connect(self._update_run_button_state)
+        self.run_button.clicked.connect(self.start_processing)
+        self.pause_button.clicked.connect(self.toggle_pause)  # 新增：暂停按钮连接
+        self.stop_button.clicked.connect(self.stop_processing)
+
+        self.processing_controller.state_changed.connect(self._on_processing_state_changed)
+        self.processing_controller.progress_updated.connect(self._on_processing_progress)
+        self.processing_controller.log_message.connect(self.log_message)
+        self.processing_controller.error_occurred.connect(self._on_processing_error)
+        self.processing_controller.processing_completed.connect(self._on_processing_completed)
+        # 新增：统计信息和内存警告信号连接
+        self.processing_controller.stats_updated.connect(self._on_stats_updated)
+        self.processing_controller.memory_warning.connect(self._on_memory_warning)
+        # --- 核心改动 ---
+        # 不再需要 engine_ready 信号，因为它现在是处理流程的一部分
+        
+    def _on_scanner_finished(self):
+        """
+        当文件扫描线程结束后被调用，防止访问已销毁的对象。
+        """
+        self.log_message(f"文件扫描完成，当前列表共 {len(self.all_files)} 个文件。")
+        self.scanner_thread = None
+        self.scanner_worker = None
+
+    def _add_paths_to_list(self, paths):
+        if self.scanner_thread and self.scanner_thread.isRunning():
+            self.log_message("[WARNING] 文件扫描仍在进行中，请稍后再添加。")
+            return
+            
+        self.scanner_worker = FileScannerWorker(self.supported_extensions)
+        self.scanner_thread = QThread()
+        self.scanner_worker.moveToThread(self.scanner_thread)
+        self.scanner_worker.file_found.connect(self._add_single_file)
+        self.scanner_worker.finished.connect(self.scanner_thread.quit)
+
+        self.scanner_thread.finished.connect(self.scanner_thread.deleteLater)
+        self.scanner_thread.finished.connect(self._on_scanner_finished) 
+        
+        self.scanner_thread.started.connect(lambda: self.scanner_worker.run(paths))
+        self.scanner_thread.start()
+
+    def select_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "选择音频/视频文件", "", f"媒体文件 ({' '.join(['*' + ext for ext in self.supported_extensions])})")
+        if files: self._add_paths_to_list(files)
+
+    def select_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择包含媒体文件的文件夹")
+        if folder: self._add_paths_to_list([folder])
+
+    def _add_single_file(self, file_path):
+        if file_path not in self.all_files:
+            self.all_files.add(file_path)
+            self.file_list_widget.addItem(QListWidgetItem(file_path))
+
+    def clear_file_list(self):
+        if self.scanner_thread and self.scanner_thread.isRunning():
+            self.scanner_worker.stop()
+            self.scanner_thread.quit()
+            self.scanner_thread.wait()
+
+        self.all_files.clear()
+        self.file_list_widget.clear()
+        self.log_message("[NOTE] 文件列表已清空")
+
+    def _update_run_button_state(self):
+        has_files = self.file_list_widget.count() > 0
+        # 只要不在处理中且有文件，就可以开始
+        can_run = has_files and not self.is_processing
+        self.run_button.setEnabled(can_run)
+
+    def start_processing(self):
+        if self.is_processing: return
+        if not self.all_files:
+            QMessageBox.warning(self, "提示", "请先添加至少一个文件。")
+            return
+        if not any([self.srt_checkbox.isChecked(), self.srt_txt_checkbox.isChecked(), self.txt_checkbox.isChecked(), self.json_checkbox.isChecked(), self.txt_md_checkbox.isChecked(), self.docx_checkbox.isChecked(), self.pdf_checkbox.isChecked()]):
+            QMessageBox.warning(self, "提示", "请至少选择一种输出格式。")
+            return
+        
+        # 【新增】提取 VAD 算法
+        vad_text = self.vad_combo.currentText()
+        vad_method = vad_text.split()[0]  # 提取 "webrtc", "auditok", "silero"
+
+        config = ProcessingConfig(
+            input_files=list(self.all_files),
+            generate_srt=self.srt_checkbox.isChecked(),
+            generate_srt_txt=self.srt_txt_checkbox.isChecked(),
+            generate_txt=self.txt_checkbox.isChecked(),
+            generate_json=self.json_checkbox.isChecked(),
+            generate_txt_md=self.txt_md_checkbox.isChecked(),
+            generate_docx=self.docx_checkbox.isChecked(),
+            generate_pdf=self.pdf_checkbox.isChecked(),
+            cfr_enabled=self.cfr_conversion_checkbox.isChecked(),
+            ffsubsync_enabled=self.ffsubsync_checkbox.isChecked(),
+            ffsubsync_vad=vad_method,  # 新增：VAD 算法
+            ffsubsync_max_offset=self.max_offset_spinbox.value(),  # 新增：最大偏移量
+            enable_resume=self.resume_checkbox.isChecked(),  # 新增：断点续传
+            device=self.device
+        )
+        
+        if self.processing_controller.start_processing(config):
+            self.is_processing = True
+            self._update_ui_for_processing_start()
+        else:
+            QMessageBox.warning(self, "无法开始", "无法启动处理流程，请检查日志获取详情。")
+
+    def toggle_pause(self):
+        """切换暂停状态"""
+        if self.processing_controller.is_paused:
+            self.processing_controller.resume_processing()
+            self.pause_button.setText("暂停")
+        else:
+            self.processing_controller.pause_processing()
+            self.pause_button.setText("恢复")
+
+    def stop_processing(self):
+        if self.processing_controller:
+            self.processing_controller.cancel_processing()
+
+    def _update_ui_for_processing_start(self):
+        """更新UI状态 - 处理开始时"""
+        self.run_button.setEnabled(False)
+        self.pause_button.setEnabled(True)  # 新增
+        self.stop_button.setEnabled(True)
+        self.select_file_button.setEnabled(False)
+        self.select_folder_button.setEnabled(False)
+        self.clear_button.setEnabled(False)
+
+    def _update_ui_for_processing_end(self):
+        """更新UI状态 - 处理结束时"""
+        self.is_processing = False
+        self.pause_button.setEnabled(False)  # 新增
+        self.pause_button.setText("暂停")  # 新增
+        self.stop_button.setEnabled(False)
+        self.run_button.setText("开始处理")
+        self._update_run_button_state()
+        self.select_file_button.setEnabled(True)
+        self.select_folder_button.setEnabled(True)
+        self.clear_button.setEnabled(True)
+
+    def _on_processing_state_changed(self, state: ProcessingState):
+        self.status_label.setText(f"状态: {state.value}")
+        if state == ProcessingState.ENGINE_STARTING:
+            self.run_button.setText("引擎启动中...")
+        elif state == ProcessingState.PROCESSING:
+            self.run_button.setText("处理中...")
+        
+        # 任何最终状态都会重置UI
+        if state in [ProcessingState.COMPLETED, ProcessingState.ERROR, ProcessingState.CANCELLED, ProcessingState.IDLE]:
+            self._update_ui_for_processing_end()
+
+    def _on_processing_progress(self, progress, message):
+        self.progress_bar.setValue(progress)
+        self.status_label.setText(f"进度 {progress}%: {message}")
+
+    def _on_processing_error(self, error_type, error_message):
+        self.log_message(f"[ERROR] 发生错误 - {error_type}: {error_message}")
+        QMessageBox.critical(self, error_type, error_message)
+
+    def _on_processing_completed(self, results):
+        self.log_message("[SUCCESS] 所有处理已完成！")
+        QMessageBox.information(self, "处理完成", f"所有任务已执行完毕。\n成功: {results['summary']['success']}, 失败: {results['summary']['failed']}")
+        # 任务完成后自动清空UI列表，为下一次任务做准备
+        self.clear_file_list()
+
+    def _on_stats_updated(self, stats_dict):
+        """更新统计信息显示"""
+        stats_text = (f"统计: 完成 {stats_dict['completed']}/{stats_dict['total']}, "
+                     f"成功率 {stats_dict['success_rate']:.1f}%, "
+                     f"峰值内存 {stats_dict['peak_memory']:.1f}%")
+        self.stats_label.setText(stats_text)
+
+    def _on_memory_warning(self, memory_percent):
+        """处理内存警告"""
+        QMessageBox.warning(self, "内存警告", 
+                           f"内存使用率达到 {memory_percent:.1f}%\n"
+                           f"建议暂停处理或关闭其他程序")
+
+    def log_message(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_widget.append(f"[{timestamp}] {message}")
+
+    def closeEvent(self, event):
+        if self.is_processing:
+            reply = QMessageBox.question(self, "确认退出", "有任务正在处理中，确定要退出吗？后台进程将全部关闭。",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                         QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                event.ignore()
+                return
+        
+        self.log_message("应用即将退出，正在关闭所有后台服务...")
+        if self.scanner_thread and self.scanner_thread.isRunning():
+            self.scanner_worker.stop()
+            self.scanner_thread.quit()
+            self.scanner_thread.wait()
+
+        # 这个调用现在会清理所有资源，包括动态启动的引擎
+        self.processing_controller.shutdown()
+        event.accept()
+
+    def _check_dependencies(self):
+        if not FFSUBSYNC_AVAILABLE:
+            self.ffsubsync_checkbox.setChecked(False)
+            self.ffsubsync_checkbox.setEnabled(False)
+            self.ffsubsync_checkbox.setToolTip("未检测到 ffsubsync, 此功能不可用。请运行 pip install ffsubsync[all]")
+            self.log_message("[WARNING] 未检测到 ffsubsync，字幕精校功能已禁用。")
+
+        # 在代码中增加检查
+        try:
+            import win32com.client
+            # 检查 Word 是否可用
+        except ImportError:
+            print("未安装 Microsoft Word，PDF 功能将禁用")
+
+def start_app():
+    # 【关键修复】spawn模式下，子进程会重新import整个模块
+    # 必须确保只在主进程中创建GUI，否则会导致multiprocessing.Manager()重复启动失败
+    import multiprocessing
+    current_process = multiprocessing.current_process()
+
+    # 只在主进程中启动GUI（进程名为'MainProcess'）
+    if current_process.name != 'MainProcess':
+        # 子进程不应该执行start_app()，直接返回
+        return
+
+    app = QApplication(sys.argv)
+
+    # 修改moviepy检测逻辑，兼容打包环境 - moviepy 改为可选依赖
+    moviepy_available = False
+    try:
+        if VideoFileClip is not None:
+            moviepy_available = True
+        else:
+            # 在打包环境中重新尝试导入
+            import moviepy.editor
+            moviepy_available = True
+    except ImportError:
+        moviepy_available = False
+
+    # moviepy 改为可选依赖，只警告不退出
+    if not moviepy_available:
+        print("[WARNING] 警告: moviepy 库未安装，视频处理功能可能受限。")
+
+    if not ensure_ffmpeg_is_ready():
+        print("[WARNING] 警告: FFmpeg环境未就绪，部分功能可能无法使用。")
+
+    window = MainWindow()
+    window.show()
+
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    # 防止在打包环境中重复启动
+    multiprocessing.freeze_support()
+    
+    # 只在真正的主进程中设置启动方法
+    if multiprocessing.current_process().name == 'MainProcess':
+        try:
+            multiprocessing.set_start_method('spawn', force=True)
+        except (RuntimeError, ValueError):
+            pass
+        
+        start_app()

@@ -1,0 +1,73 @@
+# Python缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# UV虚拟环境
+.venv/
+venv/
+ENV/
+env/
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志文件
+*.log
+*.out
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.cache
+
+# 测试和调试
+test_*.py
+debug_*.py
+*_test.py
+
+# 构建产物
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 模型缓存 (可选择性忽略)
+# model_cache/
+
+# 处理进度记录
+processing_progress.json
+
+# 临时视频/音频文件
+*_CFR.mp4
+*_extracted.wav
+
+# Windows系统文件
+Thumbs.db
+desktop.ini
+
+# macOS系统文件
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 临时文档
+*_MIGRATION_*.md
+*_ANALYSIS.md
+
+# PyInstaller打包
+# *.spec  # 保留spec文件用于打包
+build/
+dist/
+installer_output/
+
+# 打包相关临时文件
+*.manifest
+*.exe.log

@@ -1,0 +1,779 @@
+# pipeline_workers.py (v5.9.3 - 恢复原始git版本，简化诊断日志)
+import subprocess
+import json
+import sys
+import locale
+import traceback
+from pathlib import Path
+from utils import file_cleaner, run_silent, run_ffmpeg_with_progress
+import psutil
+import gc
+import time
+import os
+import shutil  # 添加shutil用于文件复制
+from silero_manager import ensure_silero_for_ffsubsync  # Silero模型管理
+
+def _ratio_to_float(ratio_str: str) -> float:
+    """将帧率比率字符串转换为浮点数 (如 "30/1" -> 30.0)"""
+    try:
+        if '/' in ratio_str:
+            numerator, denominator = ratio_str.split('/')
+            denominator_val = float(denominator)
+            if denominator_val != 0:
+                return float(numerator) / denominator_val
+        return float(ratio_str)
+    except (ValueError, ZeroDivisionError, AttributeError):
+        return 0.0
+
+def monitor_memory_usage(func_name: str, log_queue) -> float:
+    """监控内存使用并记录"""
+    try:
+        process = psutil.Process(os.getpid())
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        log_queue.put(f" [内存] {func_name}: {memory_mb:.1f} MB")
+        return memory_mb
+    except:
+        return 0.0
+
+def force_garbage_collection(log_queue, threshold_mb: float = 1000):
+    """强制垃圾回收"""
+    try:
+        process = psutil.Process(os.getpid())
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        if memory_mb > threshold_mb:
+            log_queue.put(f" [内存清理] 当前使用 {memory_mb:.1f} MB，执行垃圾回收...")
+            gc.collect()
+            new_memory_mb = process.memory_info().rss / 1024 / 1024
+            freed_mb = memory_mb - new_memory_mb
+            if freed_mb > 0:
+                log_queue.put(f" [内存清理] 释放了 {freed_mb:.1f} MB")
+    except:
+        pass
+
+# --- 后处理辅助函数 ---
+
+def _build_ffprobe_command(ffprobe_cmd: str, media_path: str,
+                           probesize: str | None, analyzeduration: str | None) -> list[str]:
+    """Build ffprobe command parameters."""
+    cmd: list[str] = [ffprobe_cmd, "-hide_banner"]
+    if probesize:
+        cmd.extend(["-probesize", probesize])
+    if analyzeduration:
+        cmd.extend(["-analyzeduration", analyzeduration])
+    cmd.extend([
+        "-v", "error",
+        "-show_entries", "stream=avg_frame_rate,r_frame_rate,codec_name,codec_type:format=duration",
+        "-of", "json",
+        media_path,
+    ])
+    return cmd
+
+def _probe_media_metadata(ffprobe_cmd: str, media_path: str, log_queue) -> tuple[dict | None, str | None, str | None]:
+    """Run ffprobe with retries to gather media metadata."""
+    attempts = [
+        ("baseline", "标准探测", "10M", "10M"),
+        ("extended", "扩展探测", "200M", "200M"),
+        ("deep", "深度探测", "0", "0"),
+    ]
+    last_error: str | None = None
+
+    for idx, (_attempt_key, label_display, probesize, analyzeduration) in enumerate(attempts):
+        cmd = _build_ffprobe_command(ffprobe_cmd, media_path, probesize, analyzeduration)
+        try:
+            result = run_silent(cmd, check=False, timeout=45)
+        except FileNotFoundError as fnf_err:
+            return None, None, f"未找到 ffprobe 可执行文件: {fnf_err}"
+        except subprocess.TimeoutExpired:
+            last_error = "探测超时"
+            if log_queue is not None and idx < len(attempts) - 1:
+                log_queue.put(f"      - ⚠️ FFProbe第{idx + 1}轮超时({label_display})，调整参数后重试")
+            continue
+        except Exception as unexpected_err:
+            return None, None, f"调用 ffprobe 失败: {unexpected_err}"
+
+        if result.returncode == 0:
+            try:
+                probe_data = json.loads(result.stdout)
+                if idx > 0 and log_queue is not None:
+                    log_queue.put(f"      - ℹ️ FFProbe在第{idx + 1}轮({label_display})成功")
+                return probe_data, label_display, None
+            except json.JSONDecodeError as json_err:
+                last_error = f"输出解析失败: {json_err}"
+        else:
+            stderr = (result.stderr or '').strip()
+            if stderr:
+                stderr = stderr.splitlines()[-1]
+            last_error = stderr or f"退出码 {result.returncode}"
+            if log_queue is not None and idx < len(attempts) - 1:
+                log_queue.put(f"      - ⚠️ FFProbe第{idx + 1}轮失败({label_display}): {last_error}")
+
+    return None, None, last_error
+def _format_srt_time(ms: int) -> str:
+    """将毫秒转换为SRT时间格式"""
+    seconds, milliseconds = divmod(ms, 1000)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d},{int(milliseconds):03d}"
+
+def _write_srt_from_result(rec_result: list, output_path: str):
+    """
+    根据识别结果写入SRT文件 (已修复索引错误并增加兼容性)
+    """
+    if not rec_result or not isinstance(rec_result, list) or len(rec_result) == 0:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("")
+        return
+
+    first_item = rec_result[0]
+    sentence_info = first_item.get('sentence_info')
+
+    # 优先使用 sentence_info
+    if sentence_info and isinstance(sentence_info, list):
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for i, sentence_data in enumerate(sentence_info):
+                start_time = _format_srt_time(sentence_data['start'])
+                end_time = _format_srt_time(sentence_data['end'])
+                text = sentence_data.get('text', '').strip()
+                if text:
+                    f.write(f"{i + 1}\n")
+                    f.write(f"{start_time} --> {end_time}\n")
+                    f.write(f"{text}\n\n")
+    # 如果没有 sentence_info，尝试使用 'timestamp' 和 'text' 字段
+    elif 'timestamp' in first_item and 'text' in first_item:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            full_text = first_item.get('text', '').strip()
+            if full_text:
+                timestamps = first_item.get('timestamp', [])
+                start_ms = timestamps[0][0] if timestamps and len(timestamps) > 0 else 0
+                end_ms = timestamps[0][1] if timestamps and len(timestamps) > 0 and len(timestamps[0]) > 1 else 1000 # 默认1秒
+
+                start_time = _format_srt_time(start_ms)
+                end_time = _format_srt_time(end_ms)
+
+                f.write("1\n")
+                f.write(f"{start_time} --> {end_time}\n")
+                f.write(f"{full_text}\n\n")
+    else:
+        # 如果两种格式都无效，则创建一个空的SRT文件
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("")
+
+# --- 流水线阶段 1：预处理 (CPU) ---
+def pre_processing_worker(task_queue, audio_queue, log_queue, progress_queue, config, ffmpeg_semaphore, pause_event=None):
+    from ffmpeg_manager import get_ffmpeg_path, get_ffprobe_path
+    FFMPEG_CMD = get_ffmpeg_path()
+    FFPROBE_CMD = get_ffprobe_path()
+
+    while True:
+        if pause_event is not None:
+            pause_event.wait()
+        try:
+            original_file_path = task_queue.get(timeout=1)
+        except Exception:
+            break
+
+        p_original = Path(original_file_path)
+        log_queue.put(f"   [预处理] 开始处理: {p_original.name}")
+
+        # 性能计时
+        t_start = time.time()
+        t_ffprobe = 0
+        t_cfr = 0
+        t_extract = 0
+
+        try:
+            video_to_process = original_file_path
+
+            # 【修复】在所有情况下都初始化变量并获取视频时长
+            total_duration_ms = 0
+            stream_info = None
+
+            # 获取视频时长（用于进度显示）
+            t_probe_start = time.time()
+            with ffmpeg_semaphore:
+                probe_data, probe_label, probe_error = _probe_media_metadata(FFPROBE_CMD, original_file_path, log_queue)
+
+            if probe_data:
+                try:
+                    all_streams = probe_data.get('streams', [])
+                    format_info = probe_data.get('format', {})
+
+                    duration_s = float(format_info.get('duration', 0))
+                    total_duration_ms = int(duration_s * 1000)
+
+                    video_stream = None
+                    audio_stream = None
+                    for stream in all_streams:
+                        codec_type = stream.get('codec_type', '')
+                        if codec_type == 'video' and video_stream is None:
+                            video_stream = stream
+                        elif codec_type == 'audio' and audio_stream is None:
+                            audio_stream = stream
+
+                    stream_info = video_stream
+
+                    if audio_stream:
+                        log_queue.put(f"      - ✅ 音频流检测到 {audio_stream.get('codec_name', 'unknown')}")
+                    else:
+                        log_queue.put("      - ⚠️ 警告: 未检测到音频流")
+
+                    if video_stream:
+                        log_queue.put(f"      - ✅ 视频流检测到 {video_stream.get('codec_name', 'unknown')}")
+                    else:
+                        log_queue.put("      - ⚠️ 警告: 未检测到视频流")
+                except (KeyError, ValueError, TypeError) as parse_err:
+                    stream_info = None
+                    log_queue.put(f"      - ⚠️ FFProbe结果解析异常: {parse_err}")
+            else:
+                stream_info = None
+                if probe_error:
+                    log_queue.put(f"      - ⚠️ FFProbe解析失败: {probe_error}")
+                if total_duration_ms == 0:
+                    try:
+                        audio_path_fallback = p_original.with_name(f"{p_original.stem}_extracted.wav")
+                        if audio_path_fallback.exists():
+                            sz = audio_path_fallback.stat().st_size
+                            total_duration_ms = int((sz / 32000.0) * 1000)
+                            log_queue.put(f"      - 使用音频文件大小估算时长: {total_duration_ms}ms")
+                    except Exception:
+                        pass
+            t_ffprobe = time.time() - t_probe_start
+
+            if config['cfr_enabled'] and p_original.suffix.lower() in config['supported_video_ext']:
+                cfr_output_path = p_original.parent / f"{p_original.stem}_CFR.mp4"
+                log_queue.put(f"      - 正在检查是否需要CFR转换...")
+
+                # 如果成功获取到视频流信息，使用数值化方式检查是否是可变帧率 (VFR)
+                is_vfr = False
+                target_fps = 30  # 默认目标帧率
+                if stream_info:
+                    avg_fr = _ratio_to_float(stream_info.get('avg_frame_rate', '0/1'))
+                    r_fr = _ratio_to_float(stream_info.get('r_frame_rate', '0/1'))
+                    # 使用浮点数比较，容许微小误差
+                    is_vfr = abs(avg_fr - r_fr) > 1e-6
+                    # 智能选择目标帧率（四舍五入源帧率）
+                    if r_fr > 0:
+                        target_fps = round(r_fr)
+
+                if is_vfr:
+                    log_queue.put(f"      - 检测到VFR，开始转换到 {target_fps} fps...")
+                    device = config.get('device', 'cpu')
+
+                    conversion_successful = False
+                    t_cfr_start = time.time()
+
+                    # --- 步骤1: 优先尝试硬件加速转换 (如果使用CUDA) ---
+                    if device == 'cuda':
+                        try:
+                            log_queue.put("         -> 尝试1/2: 使用NVIDIA NVENC硬件加速...")
+                            with ffmpeg_semaphore:  # 使用信号量限流
+                                cfr_cmd = [
+                                    "-hwaccel", "auto",  # 让FFmpeg自动选择硬件加速
+                                    "-i", original_file_path,
+                                    "-vf", f"fps={target_fps}",
+                                    "-c:v", "h264_nvenc", "-preset", "p1", "-cq", "23", "-pix_fmt", "yuv420p",
+                                    "-c:a", "copy", "-threads", "2", "-y", str(cfr_output_path)
+                                ]
+
+                                rc = run_silent([FFMPEG_CMD, "-nostdin", "-hide_banner", "-loglevel", "error"] + cfr_cmd, check=True)
+
+                            video_to_process = str(cfr_output_path)
+                            log_queue.put(f"      - ✅ 硬件加速CFR转换成功: {cfr_output_path.name}")
+                            conversion_successful = True
+
+                        except subprocess.CalledProcessError as hw_error:
+                            error_details = hw_error.stderr.strip().splitlines()[-2:] if hw_error.stderr else [str(hw_error)]
+                            log_queue.put(f"      - ⚠️ 硬件加速转换失败。错误: {error_details}")
+                            log_queue.put("         -> 将自动切换到CPU模式重试...")
+
+                    # --- 步骤2: 如果硬件转换失败或未启用，则使用CPU进行转换 ---
+                    if not conversion_successful:
+                        log_queue.put("         -> 尝试2/2: 使用CPU进行转换 (更稳定)...")
+                        with ffmpeg_semaphore:  # 使用信号量限流
+                            cfr_cmd = [
+                                "-i", original_file_path,
+                                "-vf", f"fps={target_fps}",
+                                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                                "-c:a", "copy", "-threads", "2", "-y", str(cfr_output_path)
+                            ]
+
+                            # 使用 run_silent 避免黑窗
+                            rc = run_silent([FFMPEG_CMD, "-nostdin", "-hide_banner", "-loglevel", "error"] + cfr_cmd, check=True)
+
+                        video_to_process = str(cfr_output_path)
+                        log_queue.put(f"      - ✅ CPU模式CFR转换成功: {cfr_output_path.name}")
+
+                    t_cfr = time.time() - t_cfr_start
+                else:
+                    log_queue.put(f"      - 已是CFR，跳过转换。")
+
+            # 音频提取 - 使用信号量限流和实时进度
+            audio_output_path = p_original.with_name(f"{p_original.stem}_extracted.wav")
+
+            t_extract_start = time.time()
+            with ffmpeg_semaphore:  # 使用信号量限流
+                # 准备音频提取命令（不包含 ffmpeg 本体）
+                extract_cmd = [
+                    '-i', video_to_process,
+                    '-map', 'a:0?', '-vn', '-sn', '-dn',
+                    '-acodec', 'pcm_s16le', '-ac', '1', '-ar', '16000',
+                    '-threads', '2',
+                    '-y', str(audio_output_path)
+                ]
+
+                # 如果有时长信息，使用带进度的版本
+                if total_duration_ms > 0:
+                    def emit_progress(event):
+                        # 发送FFmpeg进度事件
+                        event["file"] = str(p_original)
+                        event["stage"] = "extract"
+                        progress_queue.put(event)
+
+                    rc = run_ffmpeg_with_progress(extract_cmd, total_duration_ms, emit_progress, FFMPEG_CMD)
+                    if rc != 0:
+                        raise RuntimeError(f"FFmpeg 音频提取失败，返回码: {rc}")
+                else:
+                    # 降级到普通模式（无进度）
+                    run_silent([FFMPEG_CMD, '-nostdin', '-hide_banner', '-loglevel', 'error'] + extract_cmd, check=True)
+
+            t_extract = time.time() - t_extract_start
+
+            # 【新增】验证提取的音频是否有效（快速检测静音）
+            if audio_output_path.exists():
+                audio_size = audio_output_path.stat().st_size
+                log_queue.put(f"      - 音频文件大小: {audio_size:,} 字节")
+
+                # 快速音量检测（仅检查前10秒，避免耗时过长）
+                try:
+                    with ffmpeg_semaphore:
+                        volume_cmd = [
+                            FFMPEG_CMD, "-nostdin", "-hide_banner",
+                            "-t", "10",  # 只检查前10秒
+                            "-i", str(audio_output_path),
+                            "-af", "volumedetect",
+                            "-f", "null", "-"
+                        ]
+                        volume_result = run_silent(volume_cmd, check=False)  # 不抛异常
+
+                        # 从stderr中查找mean_volume
+                        if volume_result.stderr:
+                            for line in volume_result.stderr.split('\n'):
+                                if 'mean_volume:' in line:
+                                    try:
+                                        volume_str = line.split(':')[1].strip().split()[0]
+                                        mean_volume = float(volume_str)
+                                        log_queue.put(f"      - 音频平均音量: {mean_volume:.1f} dB")
+
+                                        # 警告：音量过低可能是静音或损坏
+                                        if mean_volume < -60:
+                                            log_queue.put(f"      - ⚠️⚠️⚠️ 警告: 音频音量过低 ({mean_volume:.1f} dB)，可能为静音或损坏！")
+                                            log_queue.put(f"      - 建议: 使用 ffmpeg 重新编码视频文件后再识别")
+                                        elif mean_volume < -40:
+                                            log_queue.put(f"      - ⚠️ 提示: 音频音量较低，识别效果可能受影响")
+                                        else:
+                                            log_queue.put(f"      - ✅ 音频音量正常")
+                                        break
+                                    except (ValueError, IndexError):
+                                        pass
+                except Exception as e:
+                    log_queue.put(f"      - ⚠️ 音量检测失败: {e}")
+            else:
+                raise FileNotFoundError(f"音频文件未生成: {audio_output_path}")
+
+            # 计算总耗时并输出性能统计
+            t_total = time.time() - t_start
+            log_queue.put(f"   ⏱️ [性能] {p_original.name}: ffprobe={t_ffprobe:.1f}s, cfr={t_cfr:.1f}s, extract={t_extract:.1f}s, total={t_total:.1f}s")
+
+            recognition_task = {
+                "original_path": original_file_path,
+                "audio_path": str(audio_output_path),
+                "video_for_sync": video_to_process
+            }
+            audio_queue.put(recognition_task)
+            log_queue.put(f"   [预处理] 音频提取成功: {p_original.name}")
+
+        except Exception as e:
+            error_msg = str(e.stderr.strip().split('\n')[-3:]) if hasattr(e, 'stderr') and e.stderr else str(e)
+            log_queue.put(f"❌ [预处理] 失败: {p_original.name}, 原因: {error_msg}")
+            progress_queue.put((-1, f"❌ 预处理失败: {p_original.name}"))
+
+# --- 流水线阶段 2：语音识别 (GPU/CPU) - 原始git版本 ---
+def recognition_worker(audio_queue, result_queue, log_queue, config, status_queue, progress_queue, pause_event=None):
+    model = None
+    processed_count = 0
+
+    try:
+        from funasr import AutoModel
+
+        # GPU优化配置
+        device = config['device']
+        if device == 'cuda':
+            import torch
+            # 设置GPU优化
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+
+            # 检测GPU内存并设置最优批处理大小
+            gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            if gpu_memory_gb >= 24:
+                batch_size_s = 25  # 高端GPU
+                max_length = 60000
+            elif gpu_memory_gb >= 12:
+                batch_size_s = 18  # 中端GPU
+                max_length = 45000
+            elif gpu_memory_gb >= 8:
+                batch_size_s = 12  # 入门GPU
+                max_length = 30000
+            else:
+                batch_size_s = 8
+                max_length = 20000
+            log_queue.put(f"🚀 GPU优化: 显存 {gpu_memory_gb:.1f}GB, 批处理大小 {batch_size_s}")
+        else:
+            batch_size_s = 15
+            max_length = 30000
+
+        log_queue.put("🔄 FunASR模型加载中...")
+        model = AutoModel(
+            model="paraformer-zh",
+            vad_model="fsmn-vad",
+            punc_model="ct-punc",
+            device=device,
+            batch_size=batch_size_s,  # 动态批处理大小
+            max_end_silence_time=800
+        )
+        log_queue.put("✅ 识别引擎加载成功。")
+        status_queue.put("ready")
+    except Exception as e:
+        log_queue.put(f"💥 致命错误: 无法加载FunASR模型! {e}")
+        status_queue.put("error")
+        return
+
+    try:
+        while True:
+            if pause_event is not None:
+                pause_event.wait()
+            task = audio_queue.get()
+            if task is None: break
+
+            p_original = Path(task['original_path'])
+            log_queue.put(f"   [识别中] -> {p_original.name}")
+            try:
+                # 检查音频文件是否存在
+                audio_path = Path(task['audio_path'])
+                if not audio_path.exists():
+                    raise FileNotFoundError(f"音频文件不存在: {audio_path}")
+
+                log_queue.put(f"      - 音频文件路径: {audio_path}")
+                log_queue.put(f"      - 音频文件大小: {audio_path.stat().st_size} 字节")
+
+                # 使用优化的参数进行识别
+                rec_result = model.generate(
+                    input=task['audio_path'],
+                    batch_size_s=batch_size_s,  # 使用动态批处理大小
+                    sentence_timestamp=True,
+                    disable_pbar=True,  # 禁用进度条，避免多进程环境下的错误
+                    disable_log=True,   # 禁用额外日志
+                    max_end_silence_time=800
+                )
+
+                # 调试：打印识别结果的结构
+                log_queue.put(f"      - 识别结果类型: {type(rec_result)}")
+                if rec_result:
+                    log_queue.put(f"      - 识别结果长度: {len(rec_result) if isinstance(rec_result, (list, dict)) else 'N/A'}")
+                    if isinstance(rec_result, list) and len(rec_result) > 0:
+                        log_queue.put(f"      - 第一个元素类型: {type(rec_result[0])}")
+                        if isinstance(rec_result[0], dict):
+                            log_queue.put(f"      - 第一个元素键: {list(rec_result[0].keys())}")
+
+                task['recognition_result'] = rec_result
+                result_queue.put(task)
+                log_queue.put(f"   [识别完成] -> {p_original.name}")
+
+                # 处理计数和内存清理
+                processed_count += 1
+
+                # 每处理3个文件进行一次内存清理
+                if processed_count % 3 == 0:
+                    if device == 'cuda':
+                        import torch
+                        torch.cuda.empty_cache()
+                    force_garbage_collection(log_queue, 600)
+                    monitor_memory_usage(f"识别第{processed_count}个文件后", log_queue)
+
+            except Exception as e:
+                import traceback
+                detailed_error = traceback.format_exc()
+                log_queue.put(f"❌ [识别失败] {p_original.name}, 原因: {e}")
+                log_queue.put(f"   详细错误信息: {detailed_error}")
+                progress_queue.put((-1, f"❌ 识别失败: {p_original.name}"))
+
+    finally:
+        # 清理模型
+        if model:
+            try:
+                del model
+                log_queue.put(" [识别] 模型已释放")
+            except:
+                pass
+
+        # GPU内存清理
+        if device == 'cuda':
+            try:
+                import torch
+                torch.cuda.empty_cache()
+                log_queue.put(" [识别] GPU缓存已清理")
+            except:
+                pass
+
+        # 最终垃圾回收
+        force_garbage_collection(log_queue, 0)
+        log_queue.put(f" [识别] 工作进程结束，共处理 {processed_count} 个文件")
+
+def _soffice_convert_to_pdf(docx_path: Path, pdf_path: Path, log_queue) -> bool:
+    """
+    使用 LibreOffice 将 DOCX 转换为 PDF（跨平台兜底方案）
+
+    Args:
+        docx_path: DOCX文件路径
+        pdf_path: PDF文件路径
+        log_queue: 日志队列
+
+    Returns:
+        bool: 转换是否成功
+    """
+    from shutil import which
+    if which("soffice") is None:
+        log_queue.put("      - ⚠️ 无 LibreOffice，跳过 PDF 兜底转换")
+        return False
+
+    cmd = ["soffice", "--headless", "--convert-to", "pdf",
+           "--outdir", str(pdf_path.parent), str(docx_path)]
+
+    try:
+        result = run_silent(cmd, cwd=str(pdf_path.parent), timeout=60)
+        return result.returncode == 0
+    except Exception as e:
+        log_queue.put(f"      - ⚠️ LibreOffice转换失败: {e}")
+        return False
+
+# --- 流水线阶段 3：后处理 (CPU) ---
+def post_processing_worker(result_queue, log_queue, progress_queue, config, pause_event=None):
+    # 在工作进程启动时，尝试导入一次所需库
+    try:
+        import docx
+    except ImportError:
+        docx = None
+        log_queue.put("   [后处理警告] 未安装 'python-docx' 库，DOCX及PDF生成功能已禁用。")
+
+    try:
+        from docx2pdf import convert
+    except ImportError:
+        convert = None
+        log_queue.put("   [后处理警告] 未安装 'docx2pdf' 库，PDF生成功能已禁用。")
+    except Exception as e:
+        convert = None
+        log_queue.put(f"   [后处理警告] 导入 'docx2pdf' 失败: {e}。PDF生成功能可能不可用。")
+
+    while True:
+        if pause_event is not None:
+            pause_event.wait()
+        task = result_queue.get()
+        if task is None: break
+
+        p_original = Path(task['original_path'])
+        p_video_for_sync = Path(task['video_for_sync'])
+
+        stem = p_video_for_sync.stem
+        output_dir = p_original.parent
+        log_queue.put(f"   [后处理] 开始为视频 '{p_video_for_sync.name}' 生成文件...")
+
+        try:
+            rec_result = task.get('recognition_result')
+            srt_path = None
+
+            has_sentence_info = (rec_result and isinstance(rec_result, list) and
+                                 len(rec_result) > 0 and isinstance(rec_result[0], dict) and
+                                 rec_result[0].get('sentence_info'))
+
+            if not has_sentence_info:
+                log_queue.put(f"      - 警告: 模型在文件 '{p_original.name}' 中未识别到任何有效语音内容。")
+
+            # --- 提取完整文本 ---
+            full_text = ''
+            if has_sentence_info:
+                sentence_list = rec_result[0].get('sentence_info', [])
+                full_text = "\n".join(sentence['text'].strip() for sentence in sentence_list)
+
+            # --- 生成 SRT, TXT, MD, JSON ---
+            if config.get('generate_srt'):
+                srt_path = output_dir / f"{stem}.srt"
+                _write_srt_from_result(rec_result, str(srt_path))
+                log_queue.put(f"      - ✅ SRT字幕已生成: {srt_path.name}")
+
+            if config.get('generate_srt_txt'):
+                srt_txt_path = output_dir / f"{stem}.srt.txt"  # 使用 .srt.txt 后缀以避免冲突
+                _write_srt_from_result(rec_result, str(srt_txt_path))
+                log_queue.put(f"      - ✅ SRT(.txt)格式字幕已生成: {srt_txt_path.name}")
+
+            if config.get('generate_txt'):
+                txt_path = output_dir / f"{stem}.txt"
+                with open(txt_path, 'w', encoding='utf-8') as f: f.write(full_text)
+                log_queue.put(f"      - ✅ TXT文本已生成: {txt_path.name}")
+
+            if config.get('generate_txt_md'):
+                txt_md_path = output_dir / f"{stem}.md.txt"
+                with open(txt_md_path, 'w', encoding='utf-8') as f:
+                    f.write(f"# {stem}\n\n")
+                    f.write(full_text)
+                log_queue.put(f"      - ✅ TXT(Markdown格式)文件已生成: {txt_md_path.name}")
+
+            if config.get('generate_json'):
+                json_path = output_dir / f"{stem}.json"
+                with open(json_path, 'w', encoding='utf-8') as f: json.dump(rec_result, f, ensure_ascii=False, indent=2)
+                log_queue.put(f"      - ✅ JSON数据已生成: {json_path.name}")
+
+            # --- DOCX 和 PDF 生成流程 ---
+            needs_docx = config.get('generate_docx') or config.get('generate_pdf')
+            docx_path = None
+            if needs_docx:
+                if docx:
+                    try:
+                        docx_path = output_dir / f"{stem}.docx"
+                        document = docx.Document()
+                        document.add_heading(stem, level=1)
+                        document.add_paragraph(full_text)
+                        document.save(str(docx_path))
+                        if config.get('generate_docx'):
+                            log_queue.put(f"      - ✅ DOCX文件已生成: {docx_path.name}")
+                    except Exception as e:
+                        log_queue.put(f"      - ❌ 生成DOCX文件时出错: {e}")
+                        docx_path = None
+
+            # --- 从 DOCX 转换到 PDF ---
+            if config.get('generate_pdf'):
+                if docx_path and docx_path.exists():
+                    pdf_path = output_dir / f"{stem}.pdf"
+                    pdf_generated = False
+
+                    # 优先尝试 docx2pdf (Windows)
+                    if convert:
+                        try:
+                            log_queue.put(f"      - 正在从DOCX转换为PDF，请稍候...")
+                            convert(str(docx_path), str(pdf_path))
+                            log_queue.put(f"      - ✅ PDF文件已生成: {pdf_path.name}")
+                            pdf_generated = True
+                        except Exception as e:
+                            log_queue.put(f"      - ⚠️ docx2pdf 转换失败: {e}")
+                            log_queue.put("         -> 尝试使用 LibreOffice 兜底...")
+
+                    # 如果 docx2pdf 失败或不可用，尝试 LibreOffice
+                    if not pdf_generated:
+                        if _soffice_convert_to_pdf(docx_path, pdf_path, log_queue):
+                            log_queue.put(f"      - ✅ PDF文件已生成(LibreOffice): {pdf_path.name}")
+                            pdf_generated = True
+                        else:
+                            log_queue.put("      - ❌ PDF转换失败（docx2pdf 和 LibreOffice 都不可用）")
+                            log_queue.put("         [提示] 请安装 Microsoft Word 或 LibreOffice。")
+
+                elif needs_docx:
+                    log_queue.put("      - ⚠️ 跳过PDF生成：前置的DOCX文件未能成功创建。")
+
+            # --- 清理临时的DOCX文件 ---
+            if docx_path and docx_path.exists() and config.get('generate_pdf') and not config.get('generate_docx'):
+                # 使用优化的文件清理工具
+                success = file_cleaner.safe_remove_file(str(docx_path), log_queue.put)
+                if not success:
+                    log_queue.put(f"      - ⚠️ 中间文件清理失败，将在程序退出时强制清理: {docx_path.name}")
+
+            # --- 字幕精校 ---
+            if config.get('ffsubsync_enabled') and srt_path and srt_path.exists() and srt_path.stat().st_size > 0:
+                log_queue.put(f"      - 开始对 '{srt_path.name}' 进行 ffsubsync 字幕精校...")
+
+                # 【新增】如果使用 Silero VAD，确保模型可用
+                vad_method = config.get('ffsubsync_vad', 'silero')
+                if vad_method == 'silero':
+                    log_queue.put(f"         -> 检查 Silero VAD 模型...")
+                    try:
+                        ensure_silero_for_ffsubsync()
+                        log_queue.put(f"         -> ✅ Silero 模型已就绪")
+                    except Exception as e:
+                        log_queue.put(f"         -> ⚠️ Silero 模型检查失败: {e}")
+                        log_queue.put(f"         -> 将尝试继续执行（可能使用 PyTorch Hub）")
+
+                synced_srt_path = output_dir / f"{stem}_Ffsub.srt"
+
+                # 构建 ffsubsync 命令
+                relative_video_path = p_video_for_sync.name
+                relative_srt_path = srt_path.name
+                relative_synced_path = synced_srt_path.name
+
+                # 基础命令
+                sync_cmd = ['ffsubsync', str(relative_video_path), '-i', str(relative_srt_path), '-o', str(relative_synced_path)]
+
+                # 【新增】添加 VAD 算法选择
+                vad_method = config.get('ffsubsync_vad', 'silero')  # 默认使用 silero
+                if vad_method in ['webrtc', 'auditok', 'silero']:
+                    sync_cmd.extend(['--vad', vad_method])
+                    log_queue.put(f"         -> 使用 VAD 算法: {vad_method}")
+
+                # 【新增】添加最大偏移量限制（提高处理速度）
+                max_offset = config.get('ffsubsync_max_offset', 60)
+                if max_offset > 0:
+                    sync_cmd.extend(['--max-offset-seconds', str(max_offset)])
+                    log_queue.put(f"         -> 最大偏移量: {max_offset}秒")
+
+                # 执行 ffsubsync
+                log_queue.put(f"         -> 命令: {' '.join(sync_cmd)}")
+                result = run_silent(sync_cmd, cwd=output_dir)
+
+                if synced_srt_path.exists() and synced_srt_path.stat().st_size > 0:
+                    try:
+                        srt_path.unlink()
+                        log_queue.put(f"      - ✅ ffsubsync 精校成功！输出文件: {synced_srt_path.name}")
+
+                        # 【优化】解析 ffsubsync 输出以提取偏移信息
+                        if result.stdout:
+                            for line in result.stdout.split('\n'):
+                                if 'offset' in line.lower() or 'shift' in line.lower():
+                                    log_queue.put(f"         -> {line.strip()}")
+
+                        # 【新增】如果启用了 .srt.txt 生成，使用校准后的字幕内容更新它
+                        if config.get('generate_srt_txt'):
+                            srt_txt_path = output_dir / f"{stem}.srt.txt"
+                            try:
+                                # 复制校准后的 SRT 内容到 .srt.txt
+                                shutil.copy2(str(synced_srt_path), str(srt_txt_path))
+                                log_queue.put(f"      - ✅ 已使用校准后的字幕更新: {srt_txt_path.name}")
+                            except Exception as e:
+                                log_queue.put(f"      - 警告: 更新 .srt.txt 文件失败: {e}")
+
+                    except OSError as e:
+                        log_queue.put(f"      - 警告: ffsubsync 成功，但删除原始SRT失败: {e}")
+                else:
+                    # 【优化】提供更详细的错误信息
+                    error_details = result.stderr.strip() if result.stderr else "未知错误"
+                    log_queue.put(f"      - ⚠️ ffsubsync 执行失败或未生成有效文件。保留原始字幕。")
+                    log_queue.put(f"         -> 返回码: {result.returncode}")
+                    if error_details:
+                        # 只显示最后几行关键错误信息
+                        error_lines = error_details.split('\n')[-5:]
+                        for err_line in error_lines:
+                            if err_line.strip():
+                                log_queue.put(f"         -> 错误: {err_line.strip()}")
+
+            # --- 清理临时文件 ---
+            p_audio_temp = Path(task['audio_path'])
+            # 使用优化的文件清理工具
+            success = file_cleaner.safe_remove_file(str(p_audio_temp), log_queue.put)
+            if not success:
+                log_queue.put(f"      - ⚠️ WAV临时文件清理失败，将在程序退出时强制清理: {p_audio_temp.name}")
+
+            if p_original != p_video_for_sync:
+                log_queue.put(f"      - CFR转换完成。原始文件和新的CFR文件均已保留: {p_video_for_sync.name}")
+
+            progress_queue.put((1, f"✅ 处理成功: {p_original.name}, 已生成所选格式文件。"))
+
+        except Exception as e:
+            error_msg = traceback.format_exc()
+            log_queue.put(f"❌ [后处理] 失败: {p_original.name}, 原因: {error_msg}")
+            progress_queue.put((-1, f"❌ 后处理失败: {p_original.name}"))
